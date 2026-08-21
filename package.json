@@ -4,17 +4,20 @@
   "description": "DevPass custom provider extension for Pi coding agent with dynamic model discovery",
   "type": "module",
   "main": "index.ts",
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
+  "license": "Apache-2.0",
   "keywords": [
+    "pi-package",
     "pi",
     "pi-extension",
     "devpass",
     "llmgateway"
   ],
-  "author": "",
-  "license": "MIT"
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
 }
