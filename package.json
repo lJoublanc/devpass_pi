@@ -1,0 +1,20 @@
+{
+  "name": "devpass_pi",
+  "version": "1.0.0",
+  "description": "DevPass custom provider extension for Pi coding agent with dynamic model discovery",
+  "type": "module",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "devpass",
+    "llmgateway"
+  ],
+  "author": "",
+  "license": "MIT"
+}
