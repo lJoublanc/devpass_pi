@@ -11,14 +11,31 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const PROVIDER_ID = "devpass";
 export const PROVIDER_NAME = "DevPass";
 export const BASE_URL = "https://api.llmgateway.io/v1";
 export const MODELS_ENDPOINT = `${BASE_URL}/models`;
+export const KEY_INFO_ENDPOINT = `${BASE_URL}/key`;
 export const CACHE_FILE_NAME = "devpass-models-cache.json";
 export const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export interface DevPassKeyInfo {
+	label?: string;
+	usage?: string;
+	limit?: number | string | null;
+	devPlan?: string;
+	devPlanCreditsUsed?: string;
+	devPlanCreditsLimit?: string;
+	devPlanCreditsRemaining?: string;
+	devPlanPremiumWeeklyLimit?: string;
+	devPlanPremiumCreditsUsed?: string;
+	devPlanPremiumWeekResetsAt?: string;
+	devPlanMonthResetsAt?: string;
+	devPlanMonthlyResetsAt?: string;
+	[key: string]: unknown;
+}
 
 interface RawModelProvider {
 	providerId?: string;
@@ -694,6 +711,227 @@ export async function loadModels(
 	return { models: FALLBACK_MODELS, source: "fallback" };
 }
 
+export function formatRelativeTime(targetDate: Date, now: Date = new Date(), includePrefix = true): string {
+	const diffMs = targetDate.getTime() - now.getTime();
+	if (diffMs <= 0) return "due now";
+	const diffSec = Math.floor(diffMs / 1000);
+	const diffMin = Math.floor(diffSec / 60);
+	const diffHours = Math.floor(diffMin / 60);
+	const diffDays = Math.floor(diffHours / 24);
+
+	const prefix = includePrefix ? "in " : "";
+
+	if (diffDays > 0) {
+		const remHours = diffHours % 24;
+		return remHours > 0 ? `${prefix}${diffDays}d ${remHours}h` : `${prefix}${diffDays}d`;
+	}
+	if (diffHours > 0) {
+		const remMin = diffMin % 60;
+		return remMin > 0 ? `${prefix}${diffHours}h ${remMin}m` : `${prefix}${diffHours}h`;
+	}
+	if (diffMin > 0) {
+		return `${prefix}${diffMin}m`;
+	}
+	return `${prefix}${diffSec}s`;
+}
+
+export function stripAnsi(str: string): string {
+	return str.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+export function visibleWidth(str: string): number {
+	return stripAnsi(str).length;
+}
+
+export function truncateToWidth(str: string, maxWidth: number, ellipsis = "..."): string {
+	const stripped = stripAnsi(str);
+	if (stripped.length <= maxWidth) return str;
+	if (maxWidth <= ellipsis.length) return ellipsis.slice(0, maxWidth);
+	return stripped.slice(0, maxWidth - ellipsis.length) + ellipsis;
+}
+
+export function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+export function formatCwdForFooter(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const relativeToHome = relative(resolvedHome, resolvedCwd);
+	const isInsideHome =
+		relativeToHome === "" ||
+		(relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+
+	if (!isInsideHome) return cwd;
+	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+
+export function isPremiumModel(model: { cost?: { input?: number; output?: number } } | undefined): boolean {
+	if (!model?.cost) return false;
+	const inputCost = model.cost.input ?? 0;
+	const outputCost = model.cost.output ?? 0;
+	return outputCost >= 15.0 || inputCost >= 5.0;
+}
+
+export function formatStatusLineText(
+	keyInfo: DevPassKeyInfo | null,
+	additionalCost = 0,
+	isPremium = false,
+	now: Date = new Date(),
+): string | undefined {
+	if (!keyInfo) return undefined;
+
+	const baseUsed = parseFloat(keyInfo.devPlanCreditsUsed || keyInfo.usage || "0");
+	const limit = parseFloat(keyInfo.devPlanCreditsLimit || "0");
+	const totalUsed = baseUsed + additionalCost;
+
+	if (limit <= 0) {
+		return undefined;
+	}
+
+	const premUsed = parseFloat(keyInfo.devPlanPremiumCreditsUsed || "0");
+	const premLimit = parseFloat(keyInfo.devPlanPremiumWeeklyLimit || "0");
+	const isPremCapped = isPremium && premLimit > 0 && premUsed >= premLimit;
+
+	const pct = (totalUsed / limit) * 100;
+
+	if (pct >= 100 || isPremCapped) {
+		let resetDate: Date | null = null;
+		if (isPremCapped && keyInfo.devPlanPremiumWeekResetsAt) {
+			resetDate = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+		} else if (keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) {
+			resetDate = new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string);
+		} else if (keyInfo.devPlanPremiumWeekResetsAt) {
+			const prem = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+			if (!isNaN(prem.getTime())) {
+				resetDate = calculateNextMonthlyReset(prem, now);
+			}
+		}
+
+		if (resetDate && !isNaN(resetDate.getTime())) {
+			const relTime = formatRelativeTime(resetDate, now, false);
+			return `sub ${relTime}`;
+		}
+		return `sub 100%`;
+	}
+
+	return `sub ${Math.round(pct)}%`;
+}
+
+export function formatDateTime(date: Date): string {
+	return date.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
+
+export function calculateNextMonthlyReset(premResetDate: Date, now: Date = new Date()): Date {
+	const weekStart = new Date(premResetDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+	const targetDay = weekStart.getUTCDate();
+
+	let year = weekStart.getUTCFullYear();
+	let month = weekStart.getUTCMonth() + 1;
+
+	while (true) {
+		const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+		const day = Math.min(targetDay, daysInMonth);
+		const candidate = new Date(
+			Date.UTC(
+				year,
+				month,
+				day,
+				weekStart.getUTCHours(),
+				weekStart.getUTCMinutes(),
+				weekStart.getUTCSeconds(),
+				weekStart.getUTCMilliseconds(),
+			),
+		);
+		if (candidate.getTime() > now.getTime()) {
+			return candidate;
+		}
+		month++;
+		if (month > 11) {
+			year++;
+			month = 0;
+		}
+	}
+}
+
+export function formatSubscriptionStatus(keyInfo: DevPassKeyInfo | null, now: Date = new Date()): string {
+	if (!keyInfo) return "Unavailable";
+
+	const planType =
+		keyInfo.devPlan && keyInfo.devPlan !== "none"
+			? keyInfo.devPlan.charAt(0).toUpperCase() + keyInfo.devPlan.slice(1)
+			: (keyInfo.label || "Pay-as-you-go");
+
+	const used = parseFloat(keyInfo.devPlanCreditsUsed || keyInfo.usage || "0");
+	const limit = parseFloat(keyInfo.devPlanCreditsLimit || "0");
+	const remaining = parseFloat(keyInfo.devPlanCreditsRemaining || "0");
+
+	const percentUsed = limit > 0 ? ((used / limit) * 100).toFixed(1) : null;
+
+	const usageStr =
+		percentUsed !== null
+			? `${percentUsed}% ($${used.toFixed(2)} / $${limit.toFixed(2)} credits, $${remaining.toFixed(2)} remaining)`
+			: `$${used.toFixed(2)} used`;
+
+	const lines: string[] = [`Type: ${planType}`, `Usage: ${usageStr}`];
+
+	if (keyInfo.devPlanPremiumWeeklyLimit) {
+		const premUsed = parseFloat(keyInfo.devPlanPremiumCreditsUsed || "0");
+		const premLimit = parseFloat(keyInfo.devPlanPremiumWeeklyLimit || "0");
+		const premPct = premLimit > 0 ? ((premUsed / premLimit) * 100).toFixed(1) : "0.0";
+		lines.push(`Premium Usage: ${premPct}% ($${premUsed.toFixed(2)} / $${premLimit.toFixed(2)} weekly limit)`);
+	}
+
+	if (keyInfo.devPlanPremiumWeekResetsAt) {
+		const premResetDate = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+		if (!isNaN(premResetDate.getTime())) {
+			lines.push(`Next Premium Reset: ${formatDateTime(premResetDate)} (${formatRelativeTime(premResetDate, now)})`);
+
+			const monthResetDate =
+				keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt
+					? new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string)
+					: calculateNextMonthlyReset(premResetDate, now);
+
+			if (!isNaN(monthResetDate.getTime())) {
+				lines.push(
+					`Next Monthly Reset: ${formatDateTime(monthResetDate)} (${formatRelativeTime(monthResetDate, now)})`,
+				);
+			}
+		}
+	} else if (keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) {
+		const monthResetDate = new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string);
+		if (!isNaN(monthResetDate.getTime())) {
+			lines.push(
+				`Next Monthly Reset: ${formatDateTime(monthResetDate)} (${formatRelativeTime(monthResetDate, now)})`,
+			);
+		}
+	}
+
+	return lines.map((l) => `\n  • ${l}`).join("");
+}
+
+export async function fetchDevPassKeyInfo(apiKey: string, signal?: AbortSignal): Promise<DevPassKeyInfo | null> {
+	const response = await fetch(KEY_INFO_ENDPOINT, {
+		headers: {
+			Authorization: `Bearer ${apiKey}`,
+			"User-Agent": "devpass-pi-extension",
+		},
+		signal: signal ?? AbortSignal.timeout(6000),
+	});
+
+	if (!response.ok) {
+		throw new Error(`Failed to fetch DevPass key info: HTTP ${response.status} ${response.statusText}`);
+	}
+
+	const payload = (await response.json()) as { data?: DevPassKeyInfo } | DevPassKeyInfo;
+	return "data" in payload && payload.data ? payload.data : (payload as DevPassKeyInfo);
+}
+
 export function registerDevPassProvider(pi: ExtensionAPI, models: ProviderModelConfig[]): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
@@ -713,9 +951,229 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 
 	registerDevPassProvider(pi, models);
 
-	// Context overflow auto-recovery hook
+	let cachedKeyInfo: DevPassKeyInfo | null = null;
+	let sessionAdditionalCost = 0;
+	let requestRenderFn: (() => void) | undefined = undefined;
+
+	function setupFooter(ctx: any) {
+		if (typeof ctx?.ui?.setFooter !== "function") return;
+
+		ctx.ui.setFooter((tui: any, theme: any, footerData: any) => {
+			requestRenderFn = () => tui.requestRender();
+			const unsub = footerData?.onBranchChange?.(() => tui.requestRender());
+
+			return {
+				dispose() {
+					unsub?.();
+					requestRenderFn = undefined;
+				},
+				invalidate() {},
+				render(width: number): string[] {
+					const activeModel = ctx.model;
+					const isDevPass = activeModel?.provider === PROVIDER_ID;
+
+					// Accumulate tokens and costs across session entries
+					let input = 0;
+					let output = 0;
+					let cacheRead = 0;
+					let cacheWrite = 0;
+					let cost = 0;
+					let latestCacheHitRate: number | undefined;
+
+					const entries = (ctx.sessionManager?.getEntries?.() as any[]) || [];
+					for (const entry of entries) {
+						if (entry.type === "message" && entry.message?.role === "assistant" && entry.message?.usage) {
+							const u = entry.message.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+							const promptTokens = (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+							latestCacheHitRate = promptTokens > 0 ? ((u.cacheRead || 0) / promptTokens) * 100 : undefined;
+						} else if (entry.type === "message" && entry.message?.role === "toolResult" && entry.message?.usage) {
+							const u = entry.message.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+						} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+							const u = entry.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+						}
+					}
+
+					// Context usage
+					const contextUsage = ctx.getContextUsage?.();
+					const contextWindow = contextUsage?.contextWindow ?? activeModel?.contextWindow ?? 0;
+					const contextPercentValue = contextUsage?.percent ?? 0;
+					const contextPercent =
+						contextUsage?.percent !== null && contextUsage?.percent !== undefined
+							? contextPercentValue.toFixed(1)
+							: "?";
+
+					// Cwd & Git branch & Session name
+					const rawCwd = ctx.sessionManager?.getCwd?.() || process.cwd();
+					let pwd = formatCwdForFooter(rawCwd, process.env.HOME || process.env.USERPROFILE);
+					const branch = footerData?.getGitBranch?.();
+					if (branch) {
+						pwd = `${pwd} (${branch})`;
+					}
+					const sessionName = ctx.sessionManager?.getSessionName?.();
+					if (sessionName) {
+						pwd = `${pwd} • ${sessionName}`;
+					}
+
+					// Build stats parts on Line 2
+					const statsParts: string[] = [];
+					if (input > 0) statsParts.push(`↑${formatTokens(input)}`);
+					if (output > 0) statsParts.push(`↓${formatTokens(output)}`);
+					if (cacheRead > 0) statsParts.push(`R${formatTokens(cacheRead)}`);
+					if (cacheWrite > 0) statsParts.push(`W${formatTokens(cacheWrite)}`);
+					if ((cacheRead > 0 || cacheWrite > 0) && latestCacheHitRate !== undefined) {
+						statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+					}
+
+					// Subscription & cost display
+					if (isDevPass) {
+						const isPrem = isPremiumModel(activeModel);
+						const subText = formatStatusLineText(cachedKeyInfo, sessionAdditionalCost, isPrem);
+						const subPart = subText ? ` ${subText}` : "";
+						statsParts.push(`$${cost.toFixed(3)}${subPart}`);
+					} else {
+						if (cost > 0) {
+							statsParts.push(`$${cost.toFixed(3)}`);
+						}
+					}
+
+					// Context percentage display
+					const autoIndicator = " (auto)";
+					const contextPercentDisplay =
+						contextPercent === "?"
+							? `?/${formatTokens(contextWindow)}${autoIndicator}`
+							: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
+
+					let contextPercentStr: string;
+					if (contextPercentValue > 90) {
+						contextPercentStr = theme?.fg ? theme.fg("error", contextPercentDisplay) : contextPercentDisplay;
+					} else if (contextPercentValue > 70) {
+						contextPercentStr = theme?.fg ? theme.fg("warning", contextPercentDisplay) : contextPercentDisplay;
+					} else {
+						contextPercentStr = contextPercentDisplay;
+					}
+					statsParts.push(contextPercentStr);
+
+					let statsLeft = statsParts.join(" ");
+					let statsLeftWidth = visibleWidth(statsLeft);
+					if (statsLeftWidth > width) {
+						statsLeft = truncateToWidth(statsLeft, width, "...");
+						statsLeftWidth = visibleWidth(statsLeft);
+					}
+
+					// Right side: model name and thinking level
+					const modelName = activeModel?.id || "no-model";
+					let rightSide = modelName;
+					if (activeModel?.reasoning) {
+						const thinkingLevel = ctx.thinkingLevel || "off";
+						rightSide =
+							thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+					}
+					if ((footerData?.getAvailableProviderCount?.() ?? 0) > 1 && activeModel) {
+						const withProvider = `(${activeModel.provider}) ${rightSide}`;
+						if (statsLeftWidth + 2 + visibleWidth(withProvider) <= width) {
+							rightSide = withProvider;
+						}
+					}
+
+					const rightSideWidth = visibleWidth(rightSide);
+					const minPadding = 2;
+					const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
+
+					let statsLine: string;
+					if (totalNeeded <= width) {
+						const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
+						statsLine = statsLeft + padding + rightSide;
+					} else {
+						const availableForRight = width - statsLeftWidth - minPadding;
+						if (availableForRight > 0) {
+							const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+							const truncatedRightWidth = visibleWidth(truncatedRight);
+							const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
+							statsLine = statsLeft + padding + truncatedRight;
+						} else {
+							statsLine = statsLeft;
+						}
+					}
+
+					const dimStatsLeft = theme?.fg ? theme.fg("dim", statsLeft) : statsLeft;
+					const remainder = statsLine.slice(statsLeft.length);
+					const dimRemainder = theme?.fg ? theme.fg("dim", remainder) : remainder;
+
+					const pwdLine = truncateToWidth(
+						theme?.fg ? theme.fg("dim", pwd) : pwd,
+						width,
+						theme?.fg ? theme.fg("dim", "...") : "...",
+					);
+					const lines = [pwdLine, dimStatsLeft + dimRemainder];
+
+					// Extension statuses on Line 3 (Unison and any other extensions)
+					const extensionStatuses = footerData?.getExtensionStatuses?.();
+					if (extensionStatuses && extensionStatuses.size > 0) {
+						const sortedStatuses = Array.from(extensionStatuses.entries())
+							.sort(([a], [b]) => (a as string).localeCompare(b as string))
+							.map(([, text]) => (text as string).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim());
+						const statusLine = sortedStatuses.join(" ");
+						lines.push(
+							truncateToWidth(
+								statusLine,
+								width,
+								theme?.fg ? theme.fg("dim", "...") : "...",
+							),
+						);
+					}
+
+					return lines;
+				},
+			};
+		});
+	}
+
+	// Update status on session start
+	pi.on("session_start", async (_event, ctx) => {
+		sessionAdditionalCost = 0;
+		const key = resolveDevPassApiKey();
+		if (key) {
+			try {
+				cachedKeyInfo = await fetchDevPassKeyInfo(key);
+			} catch {
+				// Silently ignore if offline
+			}
+		}
+		setupFooter(ctx);
+		requestRenderFn?.();
+	});
+
+	// Update on model selection
+	pi.on("model_select", async (_event, _ctx) => {
+		requestRenderFn?.();
+	});
+
+	// Context overflow auto-recovery hook & session usage cost tracking
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
+		if (message.role === "assistant") {
+			const isDevPass = message.provider === PROVIDER_ID || ctx.model?.provider === PROVIDER_ID;
+			if (isDevPass && message.usage?.cost?.total) {
+				sessionAdditionalCost += message.usage.cost.total;
+				requestRenderFn?.();
+			}
+		}
+
 		if (message.role !== "assistant") return;
 		if (message.stopReason !== "error") return;
 		if (message.provider !== PROVIDER_ID && ctx.model?.provider !== PROVIDER_ID) return;
@@ -748,6 +1206,11 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 			try {
 				const { models: freshModels, source } = await loadModels(currentKey, true);
 				registerDevPassProvider(pi, freshModels);
+				try {
+					cachedKeyInfo = await fetchDevPassKeyInfo(currentKey);
+					sessionAdditionalCost = 0;
+					requestRenderFn?.();
+				} catch {}
 				ctx.ui.notify(
 					`DevPass catalog refreshed: ${freshModels.length} models registered (${source}).`,
 					"info",
@@ -761,7 +1224,7 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 
 	// Register /devpass-status command
 	pi.registerCommand("devpass-status", {
-		description: "Show DevPass provider and catalog status",
+		description: "Show DevPass provider and subscription status",
 		handler: async (_args, ctx) => {
 			const currentKey = resolveDevPassApiKey();
 			const cached = loadCachedModels();
@@ -770,8 +1233,22 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 				? `${Math.round((Date.now() - cached.timestamp) / 60000)}m ago (${cached.models.length} models)`
 				: "No cache file";
 
+			let subscriptionInfo = "Not configured";
+			if (currentKey) {
+				try {
+					const keyInfo = await fetchDevPassKeyInfo(currentKey);
+					cachedKeyInfo = keyInfo;
+					sessionAdditionalCost = 0;
+					requestRenderFn?.();
+					subscriptionInfo = formatSubscriptionStatus(keyInfo);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					subscriptionInfo = `Unavailable (${msg})`;
+				}
+			}
+
 			ctx.ui.notify(
-				`DevPass Status:\n- Provider: ${PROVIDER_ID}\n- Base URL: ${BASE_URL}\n- API Key: ${keyStatus}\n- Cache: ${cacheInfo}`,
+				`DevPass Status:\n- Provider: ${PROVIDER_ID}\n- Base URL: ${BASE_URL}\n- API Key: ${keyStatus}\n- Cache: ${cacheInfo}\n- Subscription:${subscriptionInfo}`,
 				"info",
 			);
 		},
