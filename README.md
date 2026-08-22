@@ -12,7 +12,7 @@
 - **Context Overflow Auto-Recovery**: Catches context overflow errors and normalizes them for Pi's automatic compaction and retry flow.
 - **Commands**:
   - `/devpass-refresh` - Force-refreshes the remote model catalog and registers new models immediately without restarting.
-  - `/devpass-status` - Displays current DevPass configuration, API key status, and cache information.
+  - `/devpass-status` - Displays current DevPass configuration, API key status, subscription status (plan type, % used, premium & monthly resets), and cache information.
 
 ## Installation
 
@@ -69,4 +69,4 @@ pi --list-models | grep devpass
 ## Commands
 
 - `/devpass-refresh` — Fetch the latest model catalog from LLM Gateway and re-register provider models in the current session.
-- `/devpass-status` — Show the active DevPass API key status and model cache state.
+- `/devpass-status` — Show the active DevPass API key status, subscription status (plan type, % used, premium & monthly resets), and model cache state.

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import {
+	calculateNextMonthlyReset,
 	FALLBACK_MODELS,
+	fetchDevPassKeyInfo,
+	formatDateTime,
+	formatRelativeTime,
+	formatSubscriptionStatus,
+	KEY_INFO_ENDPOINT,
 	loadCachedModels,
 	loadModels,
 	mapRawModel,
@@ -110,6 +116,47 @@ async function runTests() {
 	assert.ok(cached, "Cached models should be readable");
 	assert.equal(cached.models.length, result.models.length);
 	console.log("✓ Cache serialization and deserialization verified");
+
+	// Test 8: Relative Time & Date Formatting
+	const now = new Date("2026-08-22T12:00:00.000Z");
+	const futureDays = new Date("2026-08-28T18:00:00.000Z");
+	assert.equal(formatRelativeTime(futureDays, now), "in 6d 6h");
+	assert.equal(formatDateTime(now), "2026-08-22 12:00:00 UTC");
+	console.log("✓ Relative time and date formatting verified");
+
+	// Test 9: Monthly Reset Calculation
+	const premReset = new Date("2026-08-28T15:49:09.656Z");
+	const monthlyReset = calculateNextMonthlyReset(premReset, now);
+	assert.equal(monthlyReset.toISOString(), "2026-09-21T15:49:09.656Z");
+	console.log("✓ Monthly reset calculation verified");
+
+	// Test 10: Subscription Status Formatting
+	const sampleKeyInfo = {
+		label: "Dev Plan API Key",
+		usage: "7.6981027682",
+		limit: null,
+		devPlan: "lite",
+		devPlanCreditsUsed: "7.6981027682",
+		devPlanCreditsLimit: "87",
+		devPlanCreditsRemaining: "79.30",
+		devPlanPremiumWeeklyLimit: "10.44",
+		devPlanPremiumCreditsUsed: "0.00",
+		devPlanPremiumWeekResetsAt: "2026-08-28T15:49:09.656Z",
+	};
+	const statusStr = formatSubscriptionStatus(sampleKeyInfo, now);
+	assert.ok(statusStr.includes("Type: Lite"), "Should format type");
+	assert.ok(statusStr.includes("8.8%"), "Should format % used");
+	assert.ok(statusStr.includes("Next Premium Reset:"), "Should format premium reset");
+	assert.ok(statusStr.includes("Next Monthly Reset:"), "Should format monthly reset");
+	console.log("✓ Subscription status formatting verified");
+
+	// Test 11: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
+	if (apiKey) {
+		const liveKeyInfo = await fetchDevPassKeyInfo(apiKey);
+		assert.ok(liveKeyInfo, "Key info should be returned");
+		assert.ok(liveKeyInfo.devPlan, "devPlan should be present");
+		console.log(`✓ Live key info fetched successfully (Plan: ${liveKeyInfo.devPlan}, Usage: ${liveKeyInfo.devPlanCreditsUsed}/${liveKeyInfo.devPlanCreditsLimit})`);
+	}
 
 	console.log("\nAll tests passed successfully! 🎉");
 }

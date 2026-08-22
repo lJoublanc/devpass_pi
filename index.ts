@@ -17,8 +17,25 @@ export const PROVIDER_ID = "devpass";
 export const PROVIDER_NAME = "DevPass";
 export const BASE_URL = "https://api.llmgateway.io/v1";
 export const MODELS_ENDPOINT = `${BASE_URL}/models`;
+export const KEY_INFO_ENDPOINT = `${BASE_URL}/key`;
 export const CACHE_FILE_NAME = "devpass-models-cache.json";
 export const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export interface DevPassKeyInfo {
+	label?: string;
+	usage?: string;
+	limit?: number | string | null;
+	devPlan?: string;
+	devPlanCreditsUsed?: string;
+	devPlanCreditsLimit?: string;
+	devPlanCreditsRemaining?: string;
+	devPlanPremiumWeeklyLimit?: string;
+	devPlanPremiumCreditsUsed?: string;
+	devPlanPremiumWeekResetsAt?: string;
+	devPlanMonthResetsAt?: string;
+	devPlanMonthlyResetsAt?: string;
+	[key: string]: unknown;
+}
 
 interface RawModelProvider {
 	providerId?: string;
@@ -694,6 +711,137 @@ export async function loadModels(
 	return { models: FALLBACK_MODELS, source: "fallback" };
 }
 
+export function formatRelativeTime(targetDate: Date, now: Date = new Date()): string {
+	const diffMs = targetDate.getTime() - now.getTime();
+	if (diffMs <= 0) return "due now";
+	const diffSec = Math.floor(diffMs / 1000);
+	const diffMin = Math.floor(diffSec / 60);
+	const diffHours = Math.floor(diffMin / 60);
+	const diffDays = Math.floor(diffHours / 24);
+
+	if (diffDays > 0) {
+		const remHours = diffHours % 24;
+		return remHours > 0 ? `in ${diffDays}d ${remHours}h` : `in ${diffDays}d`;
+	}
+	if (diffHours > 0) {
+		const remMin = diffMin % 60;
+		return remMin > 0 ? `in ${diffHours}h ${remMin}m` : `in ${diffHours}h`;
+	}
+	if (diffMin > 0) {
+		return `in ${diffMin}m`;
+	}
+	return `in ${diffSec}s`;
+}
+
+export function formatDateTime(date: Date): string {
+	return date.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
+
+export function calculateNextMonthlyReset(premResetDate: Date, now: Date = new Date()): Date {
+	const weekStart = new Date(premResetDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+	const targetDay = weekStart.getUTCDate();
+
+	let year = weekStart.getUTCFullYear();
+	let month = weekStart.getUTCMonth() + 1;
+
+	while (true) {
+		const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+		const day = Math.min(targetDay, daysInMonth);
+		const candidate = new Date(
+			Date.UTC(
+				year,
+				month,
+				day,
+				weekStart.getUTCHours(),
+				weekStart.getUTCMinutes(),
+				weekStart.getUTCSeconds(),
+				weekStart.getUTCMilliseconds(),
+			),
+		);
+		if (candidate.getTime() > now.getTime()) {
+			return candidate;
+		}
+		month++;
+		if (month > 11) {
+			year++;
+			month = 0;
+		}
+	}
+}
+
+export function formatSubscriptionStatus(keyInfo: DevPassKeyInfo | null, now: Date = new Date()): string {
+	if (!keyInfo) return "Unavailable";
+
+	const planType =
+		keyInfo.devPlan && keyInfo.devPlan !== "none"
+			? keyInfo.devPlan.charAt(0).toUpperCase() + keyInfo.devPlan.slice(1)
+			: (keyInfo.label || "Pay-as-you-go");
+
+	const used = parseFloat(keyInfo.devPlanCreditsUsed || keyInfo.usage || "0");
+	const limit = parseFloat(keyInfo.devPlanCreditsLimit || "0");
+	const remaining = parseFloat(keyInfo.devPlanCreditsRemaining || "0");
+
+	const percentUsed = limit > 0 ? ((used / limit) * 100).toFixed(1) : null;
+
+	const usageStr =
+		percentUsed !== null
+			? `${percentUsed}% ($${used.toFixed(2)} / $${limit.toFixed(2)} credits, $${remaining.toFixed(2)} remaining)`
+			: `$${used.toFixed(2)} used`;
+
+	const lines: string[] = [`Type: ${planType}`, `Usage: ${usageStr}`];
+
+	if (keyInfo.devPlanPremiumWeeklyLimit) {
+		const premUsed = parseFloat(keyInfo.devPlanPremiumCreditsUsed || "0");
+		const premLimit = parseFloat(keyInfo.devPlanPremiumWeeklyLimit || "0");
+		const premPct = premLimit > 0 ? ((premUsed / premLimit) * 100).toFixed(1) : "0.0";
+		lines.push(`Premium Usage: ${premPct}% ($${premUsed.toFixed(2)} / $${premLimit.toFixed(2)} weekly limit)`);
+	}
+
+	if (keyInfo.devPlanPremiumWeekResetsAt) {
+		const premResetDate = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+		if (!isNaN(premResetDate.getTime())) {
+			lines.push(`Next Premium Reset: ${formatDateTime(premResetDate)} (${formatRelativeTime(premResetDate, now)})`);
+
+			const monthResetDate =
+				keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt
+					? new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string)
+					: calculateNextMonthlyReset(premResetDate, now);
+
+			if (!isNaN(monthResetDate.getTime())) {
+				lines.push(
+					`Next Monthly Reset: ${formatDateTime(monthResetDate)} (${formatRelativeTime(monthResetDate, now)})`,
+				);
+			}
+		}
+	} else if (keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) {
+		const monthResetDate = new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string);
+		if (!isNaN(monthResetDate.getTime())) {
+			lines.push(
+				`Next Monthly Reset: ${formatDateTime(monthResetDate)} (${formatRelativeTime(monthResetDate, now)})`,
+			);
+		}
+	}
+
+	return lines.map((l) => `\n  • ${l}`).join("");
+}
+
+export async function fetchDevPassKeyInfo(apiKey: string, signal?: AbortSignal): Promise<DevPassKeyInfo | null> {
+	const response = await fetch(KEY_INFO_ENDPOINT, {
+		headers: {
+			Authorization: `Bearer ${apiKey}`,
+			"User-Agent": "devpass-pi-extension",
+		},
+		signal: signal ?? AbortSignal.timeout(6000),
+	});
+
+	if (!response.ok) {
+		throw new Error(`Failed to fetch DevPass key info: HTTP ${response.status} ${response.statusText}`);
+	}
+
+	const payload = (await response.json()) as { data?: DevPassKeyInfo } | DevPassKeyInfo;
+	return "data" in payload && payload.data ? payload.data : (payload as DevPassKeyInfo);
+}
+
 export function registerDevPassProvider(pi: ExtensionAPI, models: ProviderModelConfig[]): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
@@ -761,7 +909,7 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 
 	// Register /devpass-status command
 	pi.registerCommand("devpass-status", {
-		description: "Show DevPass provider and catalog status",
+		description: "Show DevPass provider and subscription status",
 		handler: async (_args, ctx) => {
 			const currentKey = resolveDevPassApiKey();
 			const cached = loadCachedModels();
@@ -770,8 +918,19 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 				? `${Math.round((Date.now() - cached.timestamp) / 60000)}m ago (${cached.models.length} models)`
 				: "No cache file";
 
+			let subscriptionInfo = "Not configured";
+			if (currentKey) {
+				try {
+					const keyInfo = await fetchDevPassKeyInfo(currentKey);
+					subscriptionInfo = formatSubscriptionStatus(keyInfo);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					subscriptionInfo = `Unavailable (${msg})`;
+				}
+			}
+
 			ctx.ui.notify(
-				`DevPass Status:\n- Provider: ${PROVIDER_ID}\n- Base URL: ${BASE_URL}\n- API Key: ${keyStatus}\n- Cache: ${cacheInfo}`,
+				`DevPass Status:\n- Provider: ${PROVIDER_ID}\n- Base URL: ${BASE_URL}\n- API Key: ${keyStatus}\n- Cache: ${cacheInfo}\n- Subscription:${subscriptionInfo}`,
 				"info",
 			);
 		},
