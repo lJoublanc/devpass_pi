@@ -5,7 +5,9 @@ import {
 	fetchDevPassKeyInfo,
 	formatDateTime,
 	formatRelativeTime,
+	formatStatusLineText,
 	formatSubscriptionStatus,
+	isPremiumModel,
 	KEY_INFO_ENDPOINT,
 	loadCachedModels,
 	loadModels,
@@ -150,7 +152,23 @@ async function runTests() {
 	assert.ok(statusStr.includes("Next Monthly Reset:"), "Should format monthly reset");
 	console.log("✓ Subscription status formatting verified");
 
-	// Test 11: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
+	// Test 11: Statusline Formatting & Premium Detection
+	assert.equal(isPremiumModel({ cost: { input: 5.0, output: 25.0 } }), true);
+	assert.equal(isPremiumModel({ cost: { input: 0.3, output: 2.5 } }), false);
+	assert.equal(formatStatusLineText(sampleKeyInfo, 0, false, now), "sub 9%");
+	assert.equal(formatStatusLineText(sampleKeyInfo, 10.0, false, now), "sub 20%");
+	assert.equal(formatStatusLineText(sampleKeyInfo, 85.0, false, now), "sub 30d 3h");
+
+	// Premium capped statusline check
+	const cappedKeyInfo = {
+		...sampleKeyInfo,
+		devPlanPremiumCreditsUsed: "10.44",
+	};
+	assert.equal(formatStatusLineText(cappedKeyInfo, 0, true, now), "sub 6d 3h");
+	assert.equal(formatStatusLineText(cappedKeyInfo, 0, false, now), "sub 9%");
+	console.log("✓ Statusline text formatting and premium threshold verified");
+
+	// Test 12: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
 	if (apiKey) {
 		const liveKeyInfo = await fetchDevPassKeyInfo(apiKey);
 		assert.ok(liveKeyInfo, "Key info should be returned");

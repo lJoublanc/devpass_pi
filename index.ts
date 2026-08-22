@@ -711,7 +711,7 @@ export async function loadModels(
 	return { models: FALLBACK_MODELS, source: "fallback" };
 }
 
-export function formatRelativeTime(targetDate: Date, now: Date = new Date()): string {
+export function formatRelativeTime(targetDate: Date, now: Date = new Date(), includePrefix = true): string {
 	const diffMs = targetDate.getTime() - now.getTime();
 	if (diffMs <= 0) return "due now";
 	const diffSec = Math.floor(diffMs / 1000);
@@ -719,18 +719,72 @@ export function formatRelativeTime(targetDate: Date, now: Date = new Date()): st
 	const diffHours = Math.floor(diffMin / 60);
 	const diffDays = Math.floor(diffHours / 24);
 
+	const prefix = includePrefix ? "in " : "";
+
 	if (diffDays > 0) {
 		const remHours = diffHours % 24;
-		return remHours > 0 ? `in ${diffDays}d ${remHours}h` : `in ${diffDays}d`;
+		return remHours > 0 ? `${prefix}${diffDays}d ${remHours}h` : `${prefix}${diffDays}d`;
 	}
 	if (diffHours > 0) {
 		const remMin = diffMin % 60;
-		return remMin > 0 ? `in ${diffHours}h ${remMin}m` : `in ${diffHours}h`;
+		return remMin > 0 ? `${prefix}${diffHours}h ${remMin}m` : `${prefix}${diffHours}h`;
 	}
 	if (diffMin > 0) {
-		return `in ${diffMin}m`;
+		return `${prefix}${diffMin}m`;
 	}
-	return `in ${diffSec}s`;
+	return `${prefix}${diffSec}s`;
+}
+
+export function isPremiumModel(model: { cost?: { input?: number; output?: number } } | undefined): boolean {
+	if (!model?.cost) return false;
+	const inputCost = model.cost.input ?? 0;
+	const outputCost = model.cost.output ?? 0;
+	return outputCost >= 15.0 || inputCost >= 5.0;
+}
+
+export function formatStatusLineText(
+	keyInfo: DevPassKeyInfo | null,
+	additionalCost = 0,
+	isPremium = false,
+	now: Date = new Date(),
+): string | undefined {
+	if (!keyInfo) return undefined;
+
+	const baseUsed = parseFloat(keyInfo.devPlanCreditsUsed || keyInfo.usage || "0");
+	const limit = parseFloat(keyInfo.devPlanCreditsLimit || "0");
+	const totalUsed = baseUsed + additionalCost;
+
+	if (limit <= 0) {
+		return undefined;
+	}
+
+	const premUsed = parseFloat(keyInfo.devPlanPremiumCreditsUsed || "0");
+	const premLimit = parseFloat(keyInfo.devPlanPremiumWeeklyLimit || "0");
+	const isPremCapped = isPremium && premLimit > 0 && premUsed >= premLimit;
+
+	const pct = (totalUsed / limit) * 100;
+
+	if (pct >= 100 || isPremCapped) {
+		let resetDate: Date | null = null;
+		if (isPremCapped && keyInfo.devPlanPremiumWeekResetsAt) {
+			resetDate = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+		} else if (keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) {
+			resetDate = new Date((keyInfo.devPlanMonthResetsAt || keyInfo.devPlanMonthlyResetsAt) as string);
+		} else if (keyInfo.devPlanPremiumWeekResetsAt) {
+			const prem = new Date(keyInfo.devPlanPremiumWeekResetsAt);
+			if (!isNaN(prem.getTime())) {
+				resetDate = calculateNextMonthlyReset(prem, now);
+			}
+		}
+
+		if (resetDate && !isNaN(resetDate.getTime())) {
+			const relTime = formatRelativeTime(resetDate, now, false);
+			return `sub ${relTime}`;
+		}
+		return `sub 100%`;
+	}
+
+	return `sub ${Math.round(pct)}%`;
 }
 
 export function formatDateTime(date: Date): string {
@@ -861,9 +915,52 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 
 	registerDevPassProvider(pi, models);
 
-	// Context overflow auto-recovery hook
+	let cachedKeyInfo: DevPassKeyInfo | null = null;
+	let sessionAdditionalCost = 0;
+
+	function updateStatusLine(ctx: {
+		model?: { provider?: string; cost?: { input?: number; output?: number } };
+		ui: { setStatus: (key: string, text: string | undefined) => void };
+	}) {
+		if (ctx.model?.provider !== PROVIDER_ID) {
+			ctx.ui.setStatus(PROVIDER_ID, undefined);
+			return;
+		}
+		const isPrem = isPremiumModel(ctx.model);
+		const text = formatStatusLineText(cachedKeyInfo, sessionAdditionalCost, isPrem);
+		ctx.ui.setStatus(PROVIDER_ID, text);
+	}
+
+	// Update status on session start
+	pi.on("session_start", async (_event, ctx) => {
+		sessionAdditionalCost = 0;
+		const key = resolveDevPassApiKey();
+		if (key) {
+			try {
+				cachedKeyInfo = await fetchDevPassKeyInfo(key);
+			} catch {
+				// Silently ignore if offline
+			}
+		}
+		updateStatusLine(ctx);
+	});
+
+	// Update status on model selection
+	pi.on("model_select", async (_event, ctx) => {
+		updateStatusLine(ctx);
+	});
+
+	// Context overflow auto-recovery hook & session usage cost tracking
 	pi.on("message_end", (event, ctx) => {
 		const message = event.message;
+		if (message.role === "assistant") {
+			const isDevPass = message.provider === PROVIDER_ID || ctx.model?.provider === PROVIDER_ID;
+			if (isDevPass && message.usage?.cost?.total) {
+				sessionAdditionalCost += message.usage.cost.total;
+				updateStatusLine(ctx);
+			}
+		}
+
 		if (message.role !== "assistant") return;
 		if (message.stopReason !== "error") return;
 		if (message.provider !== PROVIDER_ID && ctx.model?.provider !== PROVIDER_ID) return;
@@ -896,6 +993,11 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 			try {
 				const { models: freshModels, source } = await loadModels(currentKey, true);
 				registerDevPassProvider(pi, freshModels);
+				try {
+					cachedKeyInfo = await fetchDevPassKeyInfo(currentKey);
+					sessionAdditionalCost = 0;
+					updateStatusLine(ctx);
+				} catch {}
 				ctx.ui.notify(
 					`DevPass catalog refreshed: ${freshModels.length} models registered (${source}).`,
 					"info",
@@ -922,6 +1024,9 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 			if (currentKey) {
 				try {
 					const keyInfo = await fetchDevPassKeyInfo(currentKey);
+					cachedKeyInfo = keyInfo;
+					sessionAdditionalCost = 0;
+					updateStatusLine(ctx);
 					subscriptionInfo = formatSubscriptionStatus(keyInfo);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
