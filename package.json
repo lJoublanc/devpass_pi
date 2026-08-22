@@ -5,6 +5,10 @@
   "type": "module",
   "main": "index.ts",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lJoublanc/devpass_pi.git"
+  },
   "keywords": [
     "pi-package",
     "pi",
