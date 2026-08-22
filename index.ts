@@ -11,7 +11,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const PROVIDER_ID = "devpass";
 export const PROVIDER_NAME = "DevPass";
@@ -735,6 +735,42 @@ export function formatRelativeTime(targetDate: Date, now: Date = new Date(), inc
 	return `${prefix}${diffSec}s`;
 }
 
+export function stripAnsi(str: string): string {
+	return str.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+export function visibleWidth(str: string): number {
+	return stripAnsi(str).length;
+}
+
+export function truncateToWidth(str: string, maxWidth: number, ellipsis = "..."): string {
+	const stripped = stripAnsi(str);
+	if (stripped.length <= maxWidth) return str;
+	if (maxWidth <= ellipsis.length) return ellipsis.slice(0, maxWidth);
+	return stripped.slice(0, maxWidth - ellipsis.length) + ellipsis;
+}
+
+export function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+export function formatCwdForFooter(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const relativeToHome = relative(resolvedHome, resolvedCwd);
+	const isInsideHome =
+		relativeToHome === "" ||
+		(relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+
+	if (!isInsideHome) return cwd;
+	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+
 export function isPremiumModel(model: { cost?: { input?: number; output?: number } } | undefined): boolean {
 	if (!model?.cost) return false;
 	const inputCost = model.cost.input ?? 0;
@@ -917,18 +953,194 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 
 	let cachedKeyInfo: DevPassKeyInfo | null = null;
 	let sessionAdditionalCost = 0;
+	let requestRenderFn: (() => void) | undefined = undefined;
 
-	function updateStatusLine(ctx: {
-		model?: { provider?: string; cost?: { input?: number; output?: number } };
-		ui: { setStatus: (key: string, text: string | undefined) => void };
-	}) {
-		if (ctx.model?.provider !== PROVIDER_ID) {
-			ctx.ui.setStatus(PROVIDER_ID, undefined);
-			return;
-		}
-		const isPrem = isPremiumModel(ctx.model);
-		const text = formatStatusLineText(cachedKeyInfo, sessionAdditionalCost, isPrem);
-		ctx.ui.setStatus(PROVIDER_ID, text);
+	function setupFooter(ctx: any) {
+		if (typeof ctx?.ui?.setFooter !== "function") return;
+
+		ctx.ui.setFooter((tui: any, theme: any, footerData: any) => {
+			requestRenderFn = () => tui.requestRender();
+			const unsub = footerData?.onBranchChange?.(() => tui.requestRender());
+
+			return {
+				dispose() {
+					unsub?.();
+					requestRenderFn = undefined;
+				},
+				invalidate() {},
+				render(width: number): string[] {
+					const activeModel = ctx.model;
+					const isDevPass = activeModel?.provider === PROVIDER_ID;
+
+					// Accumulate tokens and costs across session entries
+					let input = 0;
+					let output = 0;
+					let cacheRead = 0;
+					let cacheWrite = 0;
+					let cost = 0;
+					let latestCacheHitRate: number | undefined;
+
+					const entries = (ctx.sessionManager?.getEntries?.() as any[]) || [];
+					for (const entry of entries) {
+						if (entry.type === "message" && entry.message?.role === "assistant" && entry.message?.usage) {
+							const u = entry.message.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+							const promptTokens = (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+							latestCacheHitRate = promptTokens > 0 ? ((u.cacheRead || 0) / promptTokens) * 100 : undefined;
+						} else if (entry.type === "message" && entry.message?.role === "toolResult" && entry.message?.usage) {
+							const u = entry.message.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+						} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+							const u = entry.usage;
+							input += u.input || 0;
+							output += u.output || 0;
+							cacheRead += u.cacheRead || 0;
+							cacheWrite += u.cacheWrite || 0;
+							cost += u.cost?.total || 0;
+						}
+					}
+
+					// Context usage
+					const contextUsage = ctx.getContextUsage?.();
+					const contextWindow = contextUsage?.contextWindow ?? activeModel?.contextWindow ?? 0;
+					const contextPercentValue = contextUsage?.percent ?? 0;
+					const contextPercent =
+						contextUsage?.percent !== null && contextUsage?.percent !== undefined
+							? contextPercentValue.toFixed(1)
+							: "?";
+
+					// Cwd & Git branch & Session name
+					const rawCwd = ctx.sessionManager?.getCwd?.() || process.cwd();
+					let pwd = formatCwdForFooter(rawCwd, process.env.HOME || process.env.USERPROFILE);
+					const branch = footerData?.getGitBranch?.();
+					if (branch) {
+						pwd = `${pwd} (${branch})`;
+					}
+					const sessionName = ctx.sessionManager?.getSessionName?.();
+					if (sessionName) {
+						pwd = `${pwd} • ${sessionName}`;
+					}
+
+					// Build stats parts on Line 2
+					const statsParts: string[] = [];
+					if (input > 0) statsParts.push(`↑${formatTokens(input)}`);
+					if (output > 0) statsParts.push(`↓${formatTokens(output)}`);
+					if (cacheRead > 0) statsParts.push(`R${formatTokens(cacheRead)}`);
+					if (cacheWrite > 0) statsParts.push(`W${formatTokens(cacheWrite)}`);
+					if ((cacheRead > 0 || cacheWrite > 0) && latestCacheHitRate !== undefined) {
+						statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+					}
+
+					// Subscription & cost display
+					if (isDevPass) {
+						const isPrem = isPremiumModel(activeModel);
+						const subText = formatStatusLineText(cachedKeyInfo, sessionAdditionalCost, isPrem);
+						const subPart = subText ? ` ${subText}` : "";
+						statsParts.push(`$${cost.toFixed(3)}${subPart}`);
+					} else {
+						if (cost > 0) {
+							statsParts.push(`$${cost.toFixed(3)}`);
+						}
+					}
+
+					// Context percentage display
+					const autoIndicator = " (auto)";
+					const contextPercentDisplay =
+						contextPercent === "?"
+							? `?/${formatTokens(contextWindow)}${autoIndicator}`
+							: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
+
+					let contextPercentStr: string;
+					if (contextPercentValue > 90) {
+						contextPercentStr = theme?.fg ? theme.fg("error", contextPercentDisplay) : contextPercentDisplay;
+					} else if (contextPercentValue > 70) {
+						contextPercentStr = theme?.fg ? theme.fg("warning", contextPercentDisplay) : contextPercentDisplay;
+					} else {
+						contextPercentStr = contextPercentDisplay;
+					}
+					statsParts.push(contextPercentStr);
+
+					let statsLeft = statsParts.join(" ");
+					let statsLeftWidth = visibleWidth(statsLeft);
+					if (statsLeftWidth > width) {
+						statsLeft = truncateToWidth(statsLeft, width, "...");
+						statsLeftWidth = visibleWidth(statsLeft);
+					}
+
+					// Right side: model name and thinking level
+					const modelName = activeModel?.id || "no-model";
+					let rightSide = modelName;
+					if (activeModel?.reasoning) {
+						const thinkingLevel = ctx.thinkingLevel || "off";
+						rightSide =
+							thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+					}
+					if ((footerData?.getAvailableProviderCount?.() ?? 0) > 1 && activeModel) {
+						const withProvider = `(${activeModel.provider}) ${rightSide}`;
+						if (statsLeftWidth + 2 + visibleWidth(withProvider) <= width) {
+							rightSide = withProvider;
+						}
+					}
+
+					const rightSideWidth = visibleWidth(rightSide);
+					const minPadding = 2;
+					const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
+
+					let statsLine: string;
+					if (totalNeeded <= width) {
+						const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
+						statsLine = statsLeft + padding + rightSide;
+					} else {
+						const availableForRight = width - statsLeftWidth - minPadding;
+						if (availableForRight > 0) {
+							const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+							const truncatedRightWidth = visibleWidth(truncatedRight);
+							const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
+							statsLine = statsLeft + padding + truncatedRight;
+						} else {
+							statsLine = statsLeft;
+						}
+					}
+
+					const dimStatsLeft = theme?.fg ? theme.fg("dim", statsLeft) : statsLeft;
+					const remainder = statsLine.slice(statsLeft.length);
+					const dimRemainder = theme?.fg ? theme.fg("dim", remainder) : remainder;
+
+					const pwdLine = truncateToWidth(
+						theme?.fg ? theme.fg("dim", pwd) : pwd,
+						width,
+						theme?.fg ? theme.fg("dim", "...") : "...",
+					);
+					const lines = [pwdLine, dimStatsLeft + dimRemainder];
+
+					// Extension statuses on Line 3 (Unison and any other extensions)
+					const extensionStatuses = footerData?.getExtensionStatuses?.();
+					if (extensionStatuses && extensionStatuses.size > 0) {
+						const sortedStatuses = Array.from(extensionStatuses.entries())
+							.sort(([a], [b]) => (a as string).localeCompare(b as string))
+							.map(([, text]) => (text as string).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim());
+						const statusLine = sortedStatuses.join(" ");
+						lines.push(
+							truncateToWidth(
+								statusLine,
+								width,
+								theme?.fg ? theme.fg("dim", "...") : "...",
+							),
+						);
+					}
+
+					return lines;
+				},
+			};
+		});
 	}
 
 	// Update status on session start
@@ -942,12 +1154,13 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 				// Silently ignore if offline
 			}
 		}
-		updateStatusLine(ctx);
+		setupFooter(ctx);
+		requestRenderFn?.();
 	});
 
-	// Update status on model selection
-	pi.on("model_select", async (_event, ctx) => {
-		updateStatusLine(ctx);
+	// Update on model selection
+	pi.on("model_select", async (_event, _ctx) => {
+		requestRenderFn?.();
 	});
 
 	// Context overflow auto-recovery hook & session usage cost tracking
@@ -957,7 +1170,7 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 			const isDevPass = message.provider === PROVIDER_ID || ctx.model?.provider === PROVIDER_ID;
 			if (isDevPass && message.usage?.cost?.total) {
 				sessionAdditionalCost += message.usage.cost.total;
-				updateStatusLine(ctx);
+				requestRenderFn?.();
 			}
 		}
 
@@ -996,7 +1209,7 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 				try {
 					cachedKeyInfo = await fetchDevPassKeyInfo(currentKey);
 					sessionAdditionalCost = 0;
-					updateStatusLine(ctx);
+					requestRenderFn?.();
 				} catch {}
 				ctx.ui.notify(
 					`DevPass catalog refreshed: ${freshModels.length} models registered (${source}).`,
@@ -1026,7 +1239,7 @@ export default async function devpassPi(pi: ExtensionAPI): Promise<void> {
 					const keyInfo = await fetchDevPassKeyInfo(currentKey);
 					cachedKeyInfo = keyInfo;
 					sessionAdditionalCost = 0;
-					updateStatusLine(ctx);
+					requestRenderFn?.();
 					subscriptionInfo = formatSubscriptionStatus(keyInfo);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);

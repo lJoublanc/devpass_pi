@@ -3,10 +3,12 @@ import {
 	calculateNextMonthlyReset,
 	FALLBACK_MODELS,
 	fetchDevPassKeyInfo,
+	formatCwdForFooter,
 	formatDateTime,
 	formatRelativeTime,
 	formatStatusLineText,
 	formatSubscriptionStatus,
+	formatTokens,
 	isPremiumModel,
 	KEY_INFO_ENDPOINT,
 	loadCachedModels,
@@ -16,6 +18,9 @@ import {
 	PROVIDER_NAME,
 	resolveDevPassApiKey,
 	saveCachedModels,
+	stripAnsi,
+	truncateToWidth,
+	visibleWidth,
 } from "./index.ts";
 
 async function runTests() {
@@ -168,7 +173,17 @@ async function runTests() {
 	assert.equal(formatStatusLineText(cappedKeyInfo, 0, false, now), "sub 9%");
 	console.log("✓ Statusline text formatting and premium threshold verified");
 
-	// Test 12: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
+	// Test 12: Footer Formatting Helpers
+	assert.equal(formatTokens(500), "500");
+	assert.equal(formatTokens(1500), "1.5k");
+	assert.equal(formatTokens(25000), "25k");
+	assert.equal(formatTokens(1500000), "1.5M");
+	assert.equal(stripAnsi("\x1b[31mRed\x1b[0m"), "Red");
+	assert.equal(visibleWidth("\x1b[32mGreen\x1b[0m"), 5);
+	assert.equal(truncateToWidth("HelloWorld", 6, "..."), "Hel...");
+	console.log("✓ Footer formatting helpers verified");
+
+	// Test 13: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
 	if (apiKey) {
 		const liveKeyInfo = await fetchDevPassKeyInfo(apiKey);
 		assert.ok(liveKeyInfo, "Key info should be returned");
