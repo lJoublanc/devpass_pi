@@ -600,6 +600,16 @@ export function mapRawModel(raw: RawModelItem): ProviderModelConfig | null {
 				xhigh: efforts.has("xhigh") ? "xhigh" : null,
 				max: efforts.has("max") ? "max" : null,
 			};
+			// "none" is the catalog's only signal that thinking can be switched off
+			// explicitly. pi sends map[<level>] as `reasoning_effort`, so off must name
+			// that value: without it pi omits the parameter, and models that think by
+			// default (e.g. qwen3.8-flash) keep thinking even though the level is
+			// selected. Left *absent* rather than null when the catalog has no "none":
+			// null would hide the level, whereas omitting it preserves the previous
+			// behaviour of relying on omission for models with no explicit off switch.
+			if (efforts.has("none")) {
+				thinkingLevelMap.off = "none";
+			}
 		}
 	}
 

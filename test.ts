@@ -85,6 +85,48 @@ async function runTests() {
 	assert.equal(mapped.compat?.maxTokensField, "max_tokens");
 	console.log("✓ Model metadata mapping verified");
 
+	// Test 3b: "none" maps to an explicit thinkingLevelMap.off
+	// Models that think by default need off: "none"; omitting reasoning_effort
+	// entirely (the old behaviour) leaves them thinking.
+	const withNone = mapRawModel({
+		id: "qwen3.8-flash",
+		architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+		providers: [
+			{
+				providerId: "alibaba",
+				reasoning: true,
+				// The gateway catalog over-advertises here: the model card documents
+				// only low/medium/xhigh. off is what this test is about, so the
+				// over-advertised tiers are asserted as mapped, not as correct.
+				reasoning_efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+			},
+		],
+	} as any);
+	assert.equal(withNone?.thinkingLevelMap?.off, "none", 'catalog "none" should map to off');
+	console.log("✓ Explicit off (reasoning_efforts: [\"none\"]) maps to thinkingLevelMap.off");
+
+	// Models without "none" must keep off absent (not null), so pi can still
+	// disable thinking by omitting the parameter.
+	const withoutNone = mapRawModel({
+		id: "gemini-3.7-flash",
+		architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+		providers: [
+			{
+				providerId: "google-ai-studio",
+				reasoning: true,
+				reasoning_efforts: ["minimal", "low", "medium", "high"],
+			},
+		],
+	} as any);
+	assert.ok(withoutNone?.thinkingLevelMap, "reasoning model should have a level map");
+	assert.equal(
+		"off" in withoutNone!.thinkingLevelMap!,
+		false,
+		"off must stay absent when the catalog has no \"none\"",
+	);
+	assert.equal(withoutNone?.thinkingLevelMap?.xhigh, null, "unsupported tiers are still nulled");
+	console.log("✓ Models without \"none\" leave thinkingLevelMap.off unset");
+
 	// Test 4: Filtering Deactivated & Non-Text Models
 	const deactivated = mapRawModel({
 		id: "old-model",
