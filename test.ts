@@ -24,8 +24,24 @@ import {
 	visibleWidth,
 } from "./index.ts";
 
+/**
+ * Tests are offline by default; two of them talk to LLM Gateway and must be asked
+ * for explicitly:
+ *
+ *   DEVPASS_TESTS_LIVE=1 node --experimental-strip-types test.ts
+ *
+ *   Test 6/7 - loadModels() falls back to a network fetch whenever the 24h catalog
+ *              cache is stale, and saveCachedModels() rewrites that live cache file.
+ *   Test 13  - GET /v1/key. Read-only account metadata (plan tier and the metered
+ *              credit balance the statusline renders); it starts no generation.
+ *              Gated because it reads a metered account, not because the read itself
+ *              is known to bill.
+ */
+const RUN_LIVE = /^(1|true|yes)$/i.test(process.env.DEVPASS_TESTS_LIVE ?? "");
+
 async function runTests() {
 	console.log("Running devpass_pi tests...\n");
+	if (!RUN_LIVE) console.log("(offline: gateway-dependent tests skipped; set DEVPASS_TESTS_LIVE=1 to run them)\n");
 
 	// Test 1: Provider Constants
 	assert.equal(PROVIDER_ID, "devpass");
@@ -221,18 +237,32 @@ async function runTests() {
 	assert.ok(gpt54, "Fallback models should include gpt-5.4");
 	console.log("✓ Fallback models verified (count:", FALLBACK_MODELS.length, ")");
 
-	// Test 6: Model Loading (Cache & Remote)
-	const result = await loadModels(apiKey);
-	assert.ok(result.models.length > 50, "Should load models");
-	assert.ok(["remote", "cache"].includes(result.source), `Source should be remote or cache, got: ${result.source}`);
-	console.log(`✓ Model catalog loading verified (${result.models.length} models from ${result.source})`);
+	// Test 6/7: Model Loading & Cache Round-trip
+	if (RUN_LIVE) {
+		const result = await loadModels(apiKey);
+		assert.ok(result.models.length > 50, "Should load models");
+		assert.ok(["remote", "cache"].includes(result.source), `Source should be remote or cache, got: ${result.source}`);
+		console.log(`✓ Model catalog loading verified (${result.models.length} models from ${result.source})`);
 
-	// Test 7: Cache Round-trip
-	saveCachedModels(result.models);
-	const cached = loadCachedModels();
-	assert.ok(cached, "Cached models should be readable");
-	assert.equal(cached.models.length, result.models.length);
-	console.log("✓ Cache serialization and deserialization verified");
+		saveCachedModels(result.models);
+		const cached = loadCachedModels();
+		assert.ok(cached, "Cached models should be readable");
+		assert.equal(cached.models.length, result.models.length);
+		console.log("✓ Cache serialization and deserialization verified");
+	} else {
+		// Read-only: exercises the same load path without fetching or rewriting the
+		// live cache file.
+		const cached = loadCachedModels();
+		if (cached) {
+			assert.ok(cached.models.length > 50, "Cached models should load");
+			assert.ok(cached.timestamp > 0, "Cache should carry a timestamp");
+			const reloaded = JSON.parse(JSON.stringify(cached.models));
+			assert.deepEqual(reloaded, cached.models, "Cache models should survive serialization");
+			console.log(`✓ Catalog cache read verified offline (${cached.models.length} models, no fetch, no write)`);
+		} else {
+			console.log("- Skipped catalog cache: no cache file present");
+		}
+	}
 
 	// Test 8: Relative Time & Date Formatting
 	const now = new Date("2026-08-22T12:00:00.000Z");
@@ -293,12 +323,28 @@ async function runTests() {
 	assert.equal(truncateToWidth("HelloWorld", 6, "..."), "Hel...");
 	console.log("✓ Footer formatting helpers verified");
 
-	// Test 13: Live Key Info Fetch (read-only GET /v1/key, consumes 0 LLM credits)
-	if (apiKey) {
+	// Test 13: Live Key Info Fetch (GET /v1/key)
+	if (RUN_LIVE && apiKey) {
 		const liveKeyInfo = await fetchDevPassKeyInfo(apiKey);
 		assert.ok(liveKeyInfo, "Key info should be returned");
 		assert.ok(liveKeyInfo.devPlan, "devPlan should be present");
 		console.log(`✓ Live key info fetched successfully (Plan: ${liveKeyInfo.devPlan}, Usage: ${liveKeyInfo.devPlanCreditsUsed}/${liveKeyInfo.devPlanCreditsLimit})`);
+	} else {
+		// Offline substitute: the pure formatting the live test depends on.
+		// The gateway supplies devPlanCreditsRemaining; formatSubscriptionStatus reads
+		// that field rather than deriving it from limit - used, so the fixture must.
+		const sample = {
+			label: "Dev Plan API Key",
+			devPlan: "lite",
+			devPlanCreditsUsed: "83.51617639",
+			devPlanCreditsLimit: "87",
+			devPlanCreditsRemaining: "3.48382361",
+		};
+		const status = formatSubscriptionStatus(sample as any);
+		assert.ok(status.includes("Lite"), "Status line should name the plan");
+		assert.ok(status.includes("$83.52"), "Status line should render used credits");
+		assert.ok(status.includes("$3.48"), "Status line should render remaining credits");
+		console.log("✓ Subscription status rendered from a fixture (live /v1/key fetch skipped)");
 	}
 
 	console.log("\nAll tests passed successfully! 🎉");
