@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
 	calculateNextMonthlyReset,
+	deriveThinkingLevelMap,
 	FALLBACK_MODELS,
 	fetchDevPassKeyInfo,
 	formatCwdForFooter,
@@ -126,6 +127,73 @@ async function runTests() {
 	);
 	assert.equal(withoutNone?.thinkingLevelMap?.xhigh, null, "unsupported tiers are still nulled");
 	console.log("✓ Models without \"none\" leave thinkingLevelMap.off unset");
+
+	// Test 3c: effort levels are intersected across providers, not unioned, so one
+	// over-declaring route cannot widen a model's advertised capability.
+	const disagree = [
+		{ providerId: "zai", reasoning: true, reasoning_efforts: ["low", "high", "max"] },
+		{ providerId: "novita", reasoning: true, reasoning_efforts: ["low", "high", "max"] },
+		{ providerId: "scx-ai-gp", reasoning: true, reasoning_efforts: ["low", "high", "max"] },
+		// Real glm-5.3-flash data: this lone route advertises everything.
+		{
+			providerId: "runware",
+			reasoning: true,
+			reasoning_efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+		},
+	];
+	const intersected = deriveThinkingLevelMap(disagree as any);
+	assert.equal(intersected?.low, "low", "tier agreed by all declaring providers is kept");
+	assert.equal(intersected?.high, "high", "tier agreed by all declaring providers is kept");
+	assert.equal(intersected?.max, "max", "tier agreed by all declaring providers is kept");
+	assert.equal(intersected?.medium, null, "tier claimed by only one provider is hidden");
+	assert.equal(intersected?.xhigh, null, "tier claimed by only one provider is hidden");
+	// minimal aliases onto low rather than disappearing, matching prior behaviour.
+	assert.equal(intersected?.minimal, "low", "minimal falls back to the lowest shared tier");
+	// "none" is ORed, not intersected: it is a capability, not a ranking.
+	assert.equal(intersected?.off, "none", 'off survives when only one route lists "none"');
+	console.log("✓ Effort tiers are intersected across providers while off is ORed");
+
+	// A provider declaring no tiers is unknown, not maximally restricted. minimax-m3
+	// is served by minimax (all tiers) and together-ai (["none"] only); excluding the
+	// latter keeps the map usable instead of collapsing it to off.
+	const unknownRoute = deriveThinkingLevelMap([
+		{
+			providerId: "minimax",
+			reasoning: true,
+			reasoning_efforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+		},
+		{ providerId: "together-ai", reasoning: true, reasoning_efforts: ["none"] },
+	] as any);
+	assert.equal(unknownRoute?.low, "low", "a route with no declared tiers must not veto");
+	assert.equal(unknownRoute?.minimal, "minimal", "a route with no declared tiers must not veto");
+	assert.equal(unknownRoute?.max, "max", "a route with no declared tiers must not veto");
+	console.log("✓ Providers declaring no tiers are excluded from the intersection");
+
+	// deepseek-v4-flash has 12 routes with no tier in common. Falling back to union
+	// would restore the over-advertising, so a strict majority decides instead.
+	const noConsensus = deriveThinkingLevelMap([
+		{ providerId: "a", reasoning: true, reasoning_efforts: ["low", "high", "max"] },
+		{ providerId: "b", reasoning: true, reasoning_efforts: ["high", "xhigh", "max"] },
+		{ providerId: "c", reasoning: true, reasoning_efforts: ["medium", "high"] },
+	] as any);
+	assert.equal(noConsensus?.high, "high", "majority tier is offered when intersection is empty");
+	assert.equal(noConsensus?.medium, null, "non-majority tier stays hidden when intersection is empty");
+	assert.equal(noConsensus?.low, null, "non-majority tier stays hidden when intersection is empty");
+	console.log("✓ Empty intersection falls back to majority tiers, not union");
+
+	// Degenerate inputs must not produce a bogus map.
+	assert.equal(deriveThinkingLevelMap([] as any), undefined, "no providers -> no map");
+	assert.equal(
+		deriveThinkingLevelMap([{ providerId: "x", reasoning: true }] as any),
+		undefined,
+		"providers with no efforts at all -> no map",
+	);
+	const explicitOnly = deriveThinkingLevelMap([
+		{ providerId: "x", reasoning: true, reasoning_efforts: ["none"] },
+	] as any);
+	assert.equal(explicitOnly?.off, "none", 'a route declaring only "none" still enables off');
+	assert.equal(explicitOnly?.low, null, 'a route declaring only "none" advertises no tiers');
+	console.log("✓ Degenerate provider lists map sensibly");
 
 	// Test 4: Filtering Deactivated & Non-Text Models
 	const deactivated = mapRawModel({

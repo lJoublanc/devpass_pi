@@ -507,6 +507,74 @@ export function resolveDevPassApiKey(): string | undefined {
 	return undefined;
 }
 
+/** Ordered reasoning tiers, lowest effort first. `"none"` is an off switch, not a tier. */
+const REASONING_TIERS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+type ThinkingTier = (typeof REASONING_TIERS)[number];
+
+/**
+ * Build a model's thinkingLevelMap from the reasoning_efforts declared by the
+ * providers that serve it.
+ *
+ * Providers disagree about the same model, and a single over-declaring route must
+ * not widen the map for the rest: pi sends map[<level>] as `reasoning_effort` and
+ * the gateway fails open on values a route does not support, so an advertised tier
+ * can silently do nothing. A tier is therefore offered only when every provider
+ * that declares tiers supports it.
+ *
+ * Providers declaring no tiers (reasoning_efforts absent, empty, or only "none")
+ * are unknown, not restricted, so they are excluded from the intersection. Without
+ * that, one sparse route would empty the map: `kimi-k2.6` lists only `["none"]` on
+ * together-ai next to two routes listing all six tiers.
+ *
+ * When the intersection is empty no tier is universally supported, which happens
+ * for genuinely divergent models (`deepseek-v4-flash`, 12 routes). Falling back to
+ * union would reintroduce the over-advertising, and an empty map would leave the
+ * model configurable only as off, so a strict-majority tier is offered instead.
+ *
+ * `"none"` is ORed rather than intersected: it is a capability, not a ranking, and
+ * any one route advertising it is enough to make `off` meaningful. Omitting it
+ * instead of nulling it keeps pi's existing fallback of disabling thinking by
+ * leaving `reasoning_effort` out of the request.
+ */
+export function deriveThinkingLevelMap(
+	providers: RawModelProvider[] | undefined,
+): ProviderModelConfig["thinkingLevelMap"] {
+	const declaredTiers: Set<ThinkingTier>[] = [];
+	let hasExplicitOff = false;
+
+	for (const p of providers || []) {
+		const efforts = (p.reasoning_efforts || []).map((e) => e.toLowerCase());
+		if (efforts.includes("none")) hasExplicitOff = true;
+		const tiers = new Set<ThinkingTier>(efforts.filter((e): e is ThinkingTier => (REASONING_TIERS as string[]).includes(e)));
+		if (tiers.size > 0) declaredTiers.push(tiers);
+	}
+
+	if (declaredTiers.length === 0 && !hasExplicitOff) return undefined;
+
+	let supported = new Set<ThinkingTier>(declaredTiers[0] ? [...declaredTiers[0]] : []);
+	for (const tiers of declaredTiers) {
+		supported = new Set<ThinkingTier>([...supported].filter((tier) => tiers.has(tier)));
+	}
+	if (declaredTiers.length > 1 && supported.size === 0) {
+		supported = new Set<ThinkingTier>(
+			REASONING_TIERS.filter((tier) => declaredTiers.filter((t) => t.has(tier)).length * 2 > declaredTiers.length),
+		);
+	}
+
+	const map: ProviderModelConfig["thinkingLevelMap"] = {
+		// pi's `minimal` maps onto the model's lowest advertised tier when it has none
+		// of its own, preserving the pre-existing alias rather than hiding the level.
+		minimal: supported.has("minimal") ? "minimal" : supported.has("low") ? "low" : null,
+		low: supported.has("low") ? "low" : null,
+		medium: supported.has("medium") ? "medium" : null,
+		high: supported.has("high") ? "high" : null,
+		xhigh: supported.has("xhigh") ? "xhigh" : null,
+		max: supported.has("max") ? "max" : null,
+	};
+	if (hasExplicitOff) map.off = "none";
+	return map;
+}
+
 /**
  * Map raw model metadata from LLM Gateway to Pi's ProviderModelConfig.
  */
@@ -585,32 +653,7 @@ export function mapRawModel(raw: RawModelItem): ProviderModelConfig | null {
 
 	let thinkingLevelMap: ProviderModelConfig["thinkingLevelMap"] = undefined;
 	if (isReasoning) {
-		const efforts = new Set<string>();
-		for (const p of raw.providers || []) {
-			for (const e of p.reasoning_efforts || []) {
-				efforts.add(e.toLowerCase());
-			}
-		}
-		if (efforts.size > 0) {
-			thinkingLevelMap = {
-				minimal: efforts.has("minimal") ? "minimal" : efforts.has("low") ? "low" : null,
-				low: efforts.has("low") ? "low" : null,
-				medium: efforts.has("medium") ? "medium" : null,
-				high: efforts.has("high") ? "high" : null,
-				xhigh: efforts.has("xhigh") ? "xhigh" : null,
-				max: efforts.has("max") ? "max" : null,
-			};
-			// "none" is the catalog's only signal that thinking can be switched off
-			// explicitly. pi sends map[<level>] as `reasoning_effort`, so off must name
-			// that value: without it pi omits the parameter, and models that think by
-			// default (e.g. qwen3.8-flash) keep thinking even though the level is
-			// selected. Left *absent* rather than null when the catalog has no "none":
-			// null would hide the level, whereas omitting it preserves the previous
-			// behaviour of relying on omission for models with no explicit off switch.
-			if (efforts.has("none")) {
-				thinkingLevelMap.off = "none";
-			}
-		}
+		thinkingLevelMap = deriveThinkingLevelMap(raw.providers);
 	}
 
 	return {
